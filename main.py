@@ -4,7 +4,6 @@ import math
 import numpy as np
 from ultralytics import YOLO
 
-# 분리한 모듈 임포트
 import config as cfg
 from camera_engine import CamStream, RailMapper
 from motor_control import MotorController
@@ -13,199 +12,224 @@ def nothing(x): pass
 
 def run_system():
     # 1. 초기화
-    print(f"[System] 모드: {cfg.SYSTEM_MODE} 시작")
-    
-    # 객체 생성
+    print(f"[System] 현재 모드: {cfg.SYSTEM_MODE}")
     motor = MotorController()
     mapper = RailMapper()
     cam_mtx, cam_dist = mapper.load_lens_calibration()
     
-    print(f"[System] YOLO 모델 로딩 중... ({cfg.MODEL_PATH})")
+    print(f"[System] YOLO 모델 로딩...")
     model = YOLO(cfg.MODEL_PATH)
-    
-    # 카메라 시작
     cam_stream = CamStream(src=cfg.CAM_INDEX).start()
     
-    # 렌즈 왜곡 보정 맵 생성
+    # 렌즈 보정 맵 생성
     new_cam_mtx, mapx, mapy = None, None, None
     if cam_mtx is not None:
         temp = cam_stream.read()
         while temp is None: temp = cam_stream.read()
         h, w = temp.shape[:2]
-        new_cam_mtx, _ = cv2.getOptimalNewCameraMatrix(cam_mtx, cam_dist, (w,h), 1, (w,h))
+        new_cam_mtx, roi = cv2.getOptimalNewCameraMatrix(cam_mtx, cam_dist, (w,h), 1, (w,h))
         mapx, mapy = cv2.initUndistortRectifyMap(cam_mtx, cam_dist, None, new_cam_mtx, (w,h), 5)
 
-    # 2. 캘리브레이션 실행
+    # 캘리브레이션 (화면 좌표계 설정)
     if not mapper.perform_calibration(cam_stream, cam_mtx, cam_dist, new_cam_mtx):
-        print("[System] 종료")
         cam_stream.stop()
         return
 
-    # ArUco 설정
+    # ---------------------------------------------------------
+    # [2] 초기 호밍 (Homing) - 센서 원점 잡기
+    # ---------------------------------------------------------
+    print("=========================================")
+    print(" [초기화] 아두이노 호밍(Homing) 시작...")
+    print("=========================================")
+    motor.start_homing()
+    
+    homing_done = False
+    start_wait = time.time()
+    while time.time() - start_wait < cfg.HOMING_TIMEOUT:
+        status = motor.read_status()
+        if status == "HOMED":
+            print("[System] 호밍 완료! (Arduino: HOMED)")
+            homing_done = True
+            break
+        # 화면이 멈추지 않게 업데이트
+        frame = cam_stream.read()
+        if frame is not None: cv2.imshow("Main View", frame)
+        if cv2.waitKey(10) & 0xFF == ord('q'): return
+
+    if not homing_done:
+        print("[Warning] 호밍 응답 없음. (강제 진행)")
+
+    # ---------------------------------------------------------
+    # [3] 메인 루프
+    # ---------------------------------------------------------
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
-
-    # 튜닝 윈도우 생성
-    cv2.namedWindow("Control", cv2.WINDOW_NORMAL)
-    cv2.createTrackbar('Exposure', "Control", 20, 20, nothing) 
-    cv2.createTrackbar('Gain', "Control", 100, 200, nothing)
     
-    # 상태 변수들
+    # 변수 초기화
     track_history = {}
     smooth_pos = {}
-    is_fall_active = False
+    
+    # 상태 관리 변수
+    catching_state = "IDLE"   # Catching 모드용 상태 (IDLE -> DROPPING -> DEPLOYED)
+    pid_active = False        # Tracking 모드용 활성화 플래그
     consecutive_trigger = 0
-    last_act_time = 0
-    target_rail_pos = None
-    last_known_pos = None
-    last_marker_time = 0
     
-    print("[System] 루프 진입")
-    
+    # 제어용 변수
+    last_known_my_pos = None  # 마커 놓쳤을 때 대비
+    last_act_time = 0         # PID 쿨다운용
+
     try:
         while True:
-            # A. 영상 획득 및 전처리
             frame = cam_stream.read()
             if frame is None: continue
             
             curr_time = time.time()
-            if mapx is not None:
-                frame = cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR)
-                
-            # 카메라 파라미터 조절
-            exp = cv2.getTrackbarPos('Exposure', "Control")
-            gain = cv2.getTrackbarPos('Gain', "Control")
-            cam_stream.stream.set(cv2.CAP_PROP_EXPOSURE, exp - 13)
-            cam_stream.stream.set(cv2.CAP_PROP_GAIN, gain)
+            if mapx is not None: frame = cv2.remap(frame, mapx, mapy, cv2.INTER_LINEAR)
 
-            # B. ArUco (내 위치)
-            corners, ids, _ = detector.detectMarkers(frame)
+            # 아두이노 센서 상태 수신 (중요!)
+            hw_status = motor.read_status()
+
+            # -------------------------------------
+            # A. 내 위치 파악 (ArUco) - 공통
+            # -------------------------------------
             my_pos_pct = None
-            
+            corners, ids, _ = detector.detectMarkers(frame)
             if ids is not None:
                 ids = ids.flatten()
                 for i, mid in enumerate(ids):
-                    if mid == 0: # DEVICE_MARKER_ID
+                    if mid == 0:
                         c = corners[i][0]
                         cx, cy = int(np.mean(c[:, 0])), int(np.mean(c[:, 1]))
                         cv2.aruco.drawDetectedMarkers(frame, corners)
-                        
                         my_pos_pct = mapper.transform_point((cx, cy))
-                        last_known_pos = my_pos_pct
-                        last_marker_time = curr_time
+                        last_known_my_pos = my_pos_pct
                         cv2.putText(frame, f"Me:{my_pos_pct:.1f}%", (cx, cy-20), 0, 0.5, (0,255,255), 2)
                         break
+            
+            if my_pos_pct is None: my_pos_pct = last_known_my_pos # 메모리 사용
 
-            # C. YOLO (목표물)
-            results = model.track(frame, persist=True, classes=[0, 1], verbose=False, conf=0.35)
-            high_speed_detected = False
+            # -------------------------------------
+            # B. 목표물 감지 (YOLO) - 공통
+            # -------------------------------------
+            results = model.track(frame, persist=True, classes=[0], verbose=False, conf=0.35)
+            
+            fall_detected = False
             curr_carrier_pos = None
 
             if results[0].boxes.id is not None:
-                for tid, box, cls in zip(results[0].boxes.id.int().tolist(), results[0].boxes.xyxy.cpu(), results[0].boxes.cls.tolist()):
+                for tid, box in zip(results[0].boxes.id.int().tolist(), results[0].boxes.xyxy.cpu()):
                     x1, y1, x2, y2 = map(int, box.tolist())
                     cx, cy = (x1+x2)//2, (y1+y2)//2
                     
-                    if mapper.rail_contour is not None:
-                        if cv2.pointPolygonTest(mapper.rail_contour, (cx, cy), False) < 0: continue
-
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0,0,255), 2)
+                    # 스무딩 & 속도 계산
+                    if tid not in smooth_pos: smooth_pos[tid] = (cx, cy)
+                    sx = int(cx * cfg.SMOOTHING_FACTOR + smooth_pos[tid][0] * (1-cfg.SMOOTHING_FACTOR))
+                    sy = int(cy * cfg.SMOOTHING_FACTOR + smooth_pos[tid][1] * (1-cfg.SMOOTHING_FACTOR))
+                    smooth_pos[tid] = (sx, sy)
                     
-                    if int(cls) == 0: # Carrier
-                        # 스무딩
-                        if tid in smooth_pos:
-                            sx = int(cx * cfg.SMOOTHING_FACTOR + smooth_pos[tid][0] * (1-cfg.SMOOTHING_FACTOR))
-                            sy = int(cy * cfg.SMOOTHING_FACTOR + smooth_pos[tid][1] * (1-cfg.SMOOTHING_FACTOR))
-                        else: sx, sy = cx, cy
-                        smooth_pos[tid] = (sx, sy)
-                        
-                        # 속도 계산
-                        track_history.setdefault(tid, []).append((sx, sy, curr_time))
-                        hist = track_history[tid]
-                        if len(hist) > 30: hist.pop(0)
-                        
-                        speed = 0.0
-                        if len(hist) >= 3:
-                            (lx, ly, lt), _, (fx, fy, ft) = hist[-1], hist[-2], hist[-3]
-                            dt = lt - ft
-                            if dt > 0.001:
-                                speed = math.sqrt(((lx-fx)/dt)**2 + ((ly-fy)/dt)**2)
-                        
-                        curr_pct = mapper.transform_point((sx, sy))
-                        
-                        # 낙하 판단
-                        falling = False
-                        if len(hist) >= 3:
-                            past_pct = mapper.transform_point(hist[-3][:2])
-                            falling = (curr_pct - past_pct) > 0.5
-                            
-                        if speed > cfg.INIT_VEL_THRESH and falling:
-                            high_speed_detected = True
-                            curr_carrier_pos = curr_pct
-                        
-                        cv2.putText(frame, f"V:{int(speed)}", (x1, y1-20), 0, 0.5, (0,255,255), 2)
+                    track_history.setdefault(tid, []).append((sx, sy, curr_time))
+                    if len(track_history[tid]) > 20: track_history[tid].pop(0)
+                    
+                    # 속도 판단
+                    speed = 0.0
+                    hist = track_history[tid]
+                    is_downward = False
+                    
+                    if len(hist) >= 4:
+                        (lx, ly, lt), (fx, fy, ft) = hist[-1], hist[-4]
+                        dt = lt - ft
+                        if dt > 0.01:
+                            vy = (ly - fy) / dt
+                            speed = abs(vy)
+                            if vy > 0: is_downward = True # 화면 아래로 이동 (추락)
 
-            # D. 로직 판단 (FSM)
-            if high_speed_detected: consecutive_trigger += 1
+                    # 감지 로직
+                    if speed > cfg.INIT_VEL_THRESH and is_downward:
+                        fall_detected = True
+                        curr_carrier_pos = mapper.transform_point((sx, sy))
+                    
+                    color = (0,0,255) if fall_detected else (255,0,0)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"V:{int(speed)}", (x1, y1-10), 0, 0.6, color, 2)
+
+            # 트리거 카운터
+            if fall_detected: consecutive_trigger += 1
             else: consecutive_trigger = 0
+            is_triggered = (consecutive_trigger >= cfg.INIT_TRIG_FRAMES)
+
+
+            # =========================================================
+            # C. 제어 로직 분기 (핵심 수정 부분)
+            # =========================================================
             
-            if consecutive_trigger >= cfg.INIT_TRIG_FRAMES:
-                is_fall_active = True
-                last_act_time = curr_time
-                if curr_carrier_pos:
-                    # 설정된 오프셋 적용
-                    target_rail_pos = min(100.0, curr_carrier_pos + cfg.BLOCKING_OFFSET)
+            motor_cmd = 0
 
-            # 쿨다운 체크
-            if is_fall_active and (curr_time - last_act_time > cfg.INIT_COOLDOWN):
-                if not high_speed_detected: is_fall_active = False
-
-            # E. 모터 제어
-            final_cmd = 0
-            if is_fall_active:
-                cv2.putText(frame, "!!! FALL DETECTED !!!", (300, 200), 0, 1.5, (0,0,255), 3)
+            # [CASE 1] CATCHING 모드 (급강하 -> 센서 디플로이)
+            if cfg.SYSTEM_MODE == 'CATCHING':
                 
-                ctrl_pos = my_pos_pct
-                if ctrl_pos is None and (curr_time - last_marker_time < 0.5):
-                    ctrl_pos = last_known_pos # 메모리 추적
-                
-                if ctrl_pos is not None and target_rail_pos is not None:
-                    raw_cmd, error = motor.calculate_pid_command(target_rail_pos, ctrl_pos)
-                    
-                    # [Catching 모드 전용 로직] 777 명령
-                    if cfg.SYSTEM_MODE == 'CATCHING' and cfg.ENABLE_EMERGENCY_DROP:
-                        if raw_cmd < cfg.EMERGENCY_DROP_SPEED: # 특정 속도 미만이면
-                            final_cmd = 777
-                            cv2.putText(frame, "DROP SHIELD (777)", (300, 400), 0, 1.5, (0,0,255), 4)
-                        else:
-                            final_cmd = raw_cmd
-                    else:
-                        final_cmd = raw_cmd
+                if catching_state == "IDLE":
+                    if is_triggered:
+                        print("[Catching] 낙하 감지! 급강하 시작!")
+                        catching_state = "DROPPING"
                         
-                    cv2.putText(frame, f"T:{target_rail_pos:.0f} M:{ctrl_pos:.0f} E:{error:.1f}", (200, 50), 0, 0.6, (0,255,255), 2)
-            else:
-                motor.last_error = 0 # 리셋
-            
-            motor.send_command(final_cmd)
-            
-            # F. 화면 표시 및 키 입력
+                elif catching_state == "DROPPING":
+                    # 하강 중 센서 감지 체크
+                    if hw_status == "BOTTOM_HIT":
+                        print("[Catching] 바닥 센서 감지! 디플로이 전개!")
+                        motor.deploy_shield() # 777 전송
+                        catching_state = "DEPLOYED"
+                    else:
+                        motor.emergency_drop() # -255 전송 (계속 하강)
+                        cv2.putText(frame, "!!! DROPPING !!!", (300, 300), 0, 2, (0,0,255), 4)
+
+                elif catching_state == "DEPLOYED":
+                    cv2.putText(frame, "SHIELD DEPLOYED", (300, 300), 0, 2, (0,255,0), 4)
+                    # 동작 완료 상태, 명령 없음 (0)
+
+            # [CASE 2] TRACKING 모드 (PID 제어)
+            else: 
+                # 활성화 조건 체크
+                if is_triggered:
+                    pid_active = True
+                    last_act_time = curr_time
+                
+                # 쿨다운 체크
+                if pid_active and (curr_time - last_act_time > cfg.INIT_COOLDOWN):
+                    if not fall_detected: pid_active = False
+
+                if pid_active and curr_carrier_pos is not None and my_pos_pct is not None:
+                    # 목표 위치 설정 (오프셋 포함)
+                    target = min(100.0, curr_carrier_pos + cfg.BLOCKING_OFFSET)
+                    
+                    # PID 계산
+                    cmd, err = motor.calculate_pid_command(target, my_pos_pct)
+                    motor_cmd = cmd
+                    
+                    cv2.putText(frame, f"PID Active | Err:{err:.1f}", (200, 50), 0, 0.7, (0,255,255), 2)
+                
+                # Tracking 모드여도 0이면 전송
+                if cfg.SYSTEM_MODE == 'TRACKING':
+                    motor.send_command(motor_cmd)
+
+            # 화면 갱신
             if mapper.rail_contour is not None:
                 cv2.polylines(frame, [mapper.rail_contour], True, (255,0,0), 2)
-            
             cv2.imshow("Main View", frame)
-            
+
+            # 키 입력
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('r'):
-                motor.emergency_reset()
-                is_fall_active = False
+            elif key == ord('r'): # 리셋
+                print("[System] 리셋 요청 -> 호밍 재실행")
+                catching_state = "IDLE"
+                pid_active = False
+                motor.start_homing()
 
     finally:
         motor.close()
         cam_stream.stop()
         cv2.destroyAllWindows()
-        print("[System] 종료됨")
 
 if __name__ == "__main__":
     run_system()
